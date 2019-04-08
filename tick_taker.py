@@ -2,7 +2,7 @@ import argparse
 import pandas as pd
 import numpy as np
 import alpaca_trade_api as tradeapi
-
+from collections import defaultdict
 
 class Quote():
     """
@@ -17,53 +17,77 @@ class Quote():
     """
 
     def __init__(self):
-        self.prev_bid = 0
-        self.prev_ask = 0
-        self.prev_spread = 0
-        self.bid = 0
-        self.ask = 0
-        self.bid_size = 0
-        self.ask_size = 0
-        self.spread = 0
-        self.traded = True
-        self.level_ct = 1
-        self.time = 0
-        self.symbol = ''
+        self.symbol_dict = defaultdict(dict)
+        self.default_dict = {
+            'prev_bid': 0,
+            'prev_ask': 0,
+            'prev_spread': 0,
+            'bid': 0,
+            'ask': 0,
+            'bid_size': 0,
+            'ask_size': 0,
+            'spread': 0,
+            'traded': True,
+            'level_ct': 1,
+            'time': 0
+        }
 
-    def reset(self):
+    def get_symbol_dict(self, symbol):
+        # Checks symbol dictionary exists. If not, starts a default one.
+        if symbol in self.symbol_dict.keys():
+            return_dict = self.symbol_dict[symbol]
+        else:
+            return_dict = self.default_dict
+            self.symbol_dict[symbol] = return_dict
+
+        return return_dict
+
+    def update_symbol_dict(self, symbol, update_dict):
+        # Updates symbol dictionary
+        self.symbol_dict[symbol].update(update_dict)
+
+    def reset_dict(self, symbol_dict):
         # Called when a level change happens
-        self.traded = False
-        self.level_ct += 1
+        symbol_dict['traded'] = False
+        symbol_dict['level_ct'] += 1
+        return symbol_dict
 
     def update(self, data):
+        # Get the symbol and retrieve its dictionary
+        symbol = str(data.symbol)
+        symbol_dict = self.get_symbol_dict(symbol)
+
         # Update bid and ask sizes and timestamp
-        self.bid_size = data.bidsize
-        self.ask_size = data.asksize
-        self.symbol = data.symbol
+        symbol_dict['bid_size'] = data.bidsize
+        symbol_dict['ask_size'] = data.asksize
 
         # Check if there has been a level change
         if (
-            self.bid != data.bidprice
-            and self.ask != data.askprice
+            symbol_dict['bid'] != data.bidprice
+            and symbol_dict['ask'] != data.askprice
             and round(data.askprice - data.bidprice, 2) == .01
         ):
             # Update bids and asks and time of level change
-            self.prev_bid = self.bid
-            self.prev_ask = self.ask
-            self.bid = data.bidprice
-            self.ask = data.askprice
-            self.time = data.timestamp
+            symbol_dict['prev_bid'] = symbol_dict['bid']
+            symbol_dict['prev_ask'] = symbol_dict['ask']
+            symbol_dict['bid'] = data.bidprice
+            symbol_dict['ask'] = data.askprice
+            symbol_dict['time'] = data.timestamp
+            
             # Update spreads
-            self.prev_spread = round(self.prev_ask - self.prev_bid, 3)
-            self.spread = round(self.ask - self.bid, 3)
-            print('Symbol: {} Level change: {} {} {} {} {} {}'.format(self.symbol, 
-                self.prev_bid, self.prev_ask, self.prev_spread, self.bid, self.ask, 
-                self.spread), flush=True
+            symbol_dict['prev_spread'] = round(symbol_dict['prev_ask'] - symbol_dict['prev_bid'], 3)
+            symbol_dict['spread'] = round(symbol_dict['ask'] - symbol_dict['bid'], 3)
+            print('Symbol: {} Level change: {} {} {} {} {} {}'.format(symbol, 
+                symbol_dict['prev_bid'], symbol_dict['prev_ask'], symbol_dict['prev_spread'], 
+                symbol_dict['bid'], symbol_dict['ask'], symbol_dict['spread']), flush=True
             )
             # If change is from one penny spread level to a different penny
             # spread level, then initialize for new level (reset stale vars)
-            if self.prev_spread == 0.01:
-                self.reset()
+            if symbol_dict['prev_spread'] == 0.01:
+                symbol_dict = self.reset_dict(symbol_dict)
+
+        # Update the status of the current dict
+        self.update_symbol_dict(symbol, symbol_dict)
 
 
 class Position():
@@ -128,38 +152,33 @@ def run(args):
 
 
     symbol_list = [symbol.upper() for symbol in symbol_list]
+    
     quote = Quote()
+    
     qc_list = ['Q.%s' % symbol for symbol in symbol_list]
     tc_list = ['T.%s' % symbol for symbol in symbol_list]
-    # for subscribers (not sure why it is different from qc_list)
-    qc_list_for_streaming = [r'Q\.' + symbol for symbol in symbol_list]
-    tc_list_for_streaming = [r'T\.' + symbol for symbol in symbol_list]
-    # qc = 'Q.%s' % symbol
-    # tc = 'T.%s' % symbol
-    qc_str = ','.join(qc_list)
-    tc_str = ','.join(tc_list)
-    # for subscribers
-    qc_str_for_streaming = ','.join(qc_list_for_streaming)
-    tc_str_for_streaming = ','.join(tc_list_for_streaming)
+
     position = Position()
 
     # Establish streaming connection
     conn = tradeapi.StreamConn(**opts)
 
     # Define our message handling
-    @conn.on(qc_str_for_streaming)
     async def on_quote(conn, channel, data):
+
         # Quote update received
         quote.update(data)
 
-    @conn.on(tc_str_for_streaming)
+    #@conn.on(tc_str)
     async def on_trade(conn, channel, data):
-        if quote.traded:
+        symbol = str(data.symbol)
+        symbol_dict = quote.get_symbol_dict(symbol)
+        if quote.symbol_dict[symbol]['traded']:
             return
         # We've received a trade and might be ready to follow it
         if (
             data.timestamp <= (
-                quote.time + pd.Timedelta(np.timedelta64(50, 'ms'))
+                quote.symbol_dict[symbol]['time'] + pd.Timedelta(np.timedelta64(50, 'ms'))
             )
         ):
             # The trade came too close to the quote update
@@ -172,8 +191,8 @@ def run(args):
             # a movement in that direction. We also want to be sure that
             # we're not buying or selling more than we should.
             if (
-                data.price == quote.ask
-                and quote.bid_size > (quote.ask_size * 1.8)
+                data.price == quote.symbol_dict[symbol]['ask']
+                and quote.symbol_dict[symbol]['bid_size'] > (quote.symbol_dict[symbol]['ask_size'] * 1.8)
                 and (
                     position.total_shares + position.pending_buy_shares
                 ) < max_shares - 100
@@ -183,19 +202,19 @@ def run(args):
                     o = api.submit_order(
                         symbol=symbol, qty='100', side='buy',
                         type='limit', time_in_force='day',
-                        limit_price=str(quote.ask)
+                        limit_price=str(quote.symbol_dict[symbol]['ask'])
                     )
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
                     position.update_pending_buy_shares(100)
                     position.orders_filled_amount[o.id] = 0
-                    print('Buy at', quote.ask, flush=True)
-                    quote.traded = True
+                    print('Buy {} at {}'.format(symbol, quote.symbol_dict[symbol]['ask']), flush=True)
+                    quote.symbol_dict[symbol]['traded'] = True
                 except Exception as e:
                     print(e)
             elif (
-                data.price == quote.bid
-                and quote.ask_size > (quote.bid_size * 1.8)
+                data.price == quote.symbol_dict[symbol]['bid']
+                and quote.symbol_dict[symbol]['ask_size'] > (quote.symbol_dict[symbol]['bid_size'] * 1.8)
                 and (
                     position.total_shares - position.pending_sell_shares
                 ) >= 100
@@ -205,14 +224,14 @@ def run(args):
                     o = api.submit_order(
                         symbol=symbol, qty='100', side='sell',
                         type='limit', time_in_force='day',
-                        limit_price=str(quote.bid)
+                        limit_price=str(quote.symbol_dict[symbol]['bid'])
                     )
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
                     position.update_pending_sell_shares(100)
                     position.orders_filled_amount[o.id] = 0
-                    print('Sell at', quote.bid, flush=True)
-                    quote.traded = True
+                    print('Sell {} at {}'.format(symbol, quote.symbol_dict[symbol]['bid']), flush=True)
+                    quote.symbol_dict[symbol]['traded'] = True
                 except Exception as e:
                     print(e)
 
@@ -243,8 +262,12 @@ def run(args):
                 data.order['id'], data.order['side']
             )
 
+    for symbol in symbol_list:
+        conn.register(r'Q\.' + symbol, on_quote)
+        conn.register(r'T\.' + symbol, on_trade)
+
     conn.run(
-        ['trade_updates', qc_str, tc_str]
+        ['trade_updates'] + qc_list + tc_list
     )
 
 
